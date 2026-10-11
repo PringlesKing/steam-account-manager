@@ -68,11 +68,10 @@ bool draw(app::AppState& state) {
 
         if (state.unlocked) {
 
-            if (state.pending_relogin_login.has_value() &&
-                state.current_screen != app::Screen::AddAccount) {
-                state.current_screen = app::Screen::AddAccount;
-                state.selected_account_id.clear();
-            }
+            // A background refresh can discover that an account needs a fresh Steam
+            // login. Keep that request pending, but never steal the user's current
+            // screen. If the user opens Add account manually, draw_add_account() will
+            // select Full login and prefill the affected username.
 
             widgets::draw_rail_nav(state);
             ImGui::SameLine(0, 0);
