@@ -110,8 +110,26 @@ int compare_for_sort(const Account& a, const Account& b, SortKey k, std::int64_t
         case SortKey::NoCooldownFirst: {
             const bool ca = has_active_cooldown(a, now);
             const bool cb = has_active_cooldown(b, now);
-            if (ca == cb) return 0;
-            return !ca ? -1 : 1;
+
+            // Primary bucket: accounts without an active cooldown always come first.
+            if (ca != cb) return !ca ? -1 : 1;
+
+            if (!ca) {
+                // Within the no-cooldown bucket, prefer the most recently logged-in
+                // account. Accounts that have never been logged into (0) naturally
+                // fall to the bottom of this bucket.
+                if (a.last_login_unix == b.last_login_unix) return 0;
+                return a.last_login_unix > b.last_login_unix ? -1 : 1;
+            }
+
+            // Within the active-cooldown bucket, the cooldown that expires first
+            // goes first. Permanent cooldowns use INT64_MAX and therefore stay at
+            // the bottom. Use last login as a deterministic secondary key.
+            const auto ka = cooldown_sort_key(a, now);
+            const auto kb = cooldown_sort_key(b, now);
+            if (ka != kb) return ka < kb ? -1 : 1;
+            if (a.last_login_unix == b.last_login_unix) return 0;
+            return a.last_login_unix > b.last_login_unix ? -1 : 1;
         }
         case SortKey::DropUnclaimedFirst: {
             const bool da = drop_claimed(a, now);
@@ -143,6 +161,15 @@ std::vector<std::size_t> apply_filter(const std::vector<Account>& accounts,
         if (passes(accounts[i], filter, q_lower)) out.push_back(i);
     }
     std::stable_sort(out.begin(), out.end(), [&](std::size_t a, std::size_t b) {
+        // NoCooldownFirst has a stronger, user-visible grouping guarantee: every
+        // no-cooldown account must stay above every active-cooldown account. Apply
+        // that full ordering before the usual revoked-token preference so an NFA
+        // account with a cooldown cannot jump above the no-cooldown bucket.
+        if (filter.sort == SortKey::NoCooldownFirst) {
+            const int cmp = compare_for_sort(
+                accounts[a], accounts[b], filter.sort, filter.now_unix);
+            if (cmp != 0) return cmp < 0;
+        }
 
         const bool ra = accounts[a].nfa_status == NfaTokenStatus::Revoked;
         const bool rb = accounts[b].nfa_status == NfaTokenStatus::Revoked;
