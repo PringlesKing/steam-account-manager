@@ -6,6 +6,7 @@
     <Filter Include="core"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000002}</UniqueIdentifier></Filter>
     <Filter Include="core\sda"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000003}</UniqueIdentifier></Filter>
     <Filter Include="core\steam_api"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000004}</UniqueIdentifier></Filter>
+    <Filter Include="core\steam_bans"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000046}</UniqueIdentifier></Filter>
     <Filter Include="core\steam_login"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000005}</UniqueIdentifier></Filter>
     <Filter Include="core\steam_auth"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000006}</UniqueIdentifier></Filter>
     <Filter Include="core\steam_auth\gen"><UniqueIdentifier>{1a000000-0000-0000-0000-000000000015}</UniqueIdentifier></Filter>
@@ -68,6 +69,7 @@
 
     <ClCompile Include="core\steam_api\web_api.cpp"><Filter>core\steam_api</Filter></ClCompile>
     <ClCompile Include="core\steam_api\ban_check.cpp"><Filter>core\steam_api</Filter></ClCompile>
+    <ClCompile Include="core\steam_bans\private_ban.cpp"><Filter>core\steam_bans</Filter></ClCompile>
     <ClCompile Include="core\steam_api\summaries.cpp"><Filter>core\steam_api</Filter></ClCompile>
 
     <ClCompile Include="core\steam_login\mobile_auth.cpp"><Filter>core\steam_login</Filter></ClCompile>
@@ -380,6 +382,7 @@
 
     <ClInclude Include="core\steam_api\web_api.hpp"><Filter>core\steam_api</Filter></ClInclude>
     <ClInclude Include="core\steam_api\ban_check.hpp"><Filter>core\steam_api</Filter></ClInclude>
+    <ClInclude Include="core\steam_bans\private_ban.hpp"><Filter>core\steam_bans</Filter></ClInclude>
     <ClInclude Include="core\steam_api\summaries.hpp"><Filter>core\steam_api</Filter></ClInclude>
 
     <ClInclude Include="core\steam_login\mobile_auth.hpp"><Filter>core\steam_login</Filter></ClInclude>

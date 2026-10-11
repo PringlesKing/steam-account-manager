@@ -63,6 +63,8 @@ struct ProfileRanks {
     int premier_wins = -1;
     int wingman_rank = -1;
     int wingman_wins = -1;
+    // MatchmakingGC2ClientHello::vac_banned. -1 = unknown, 0 = clear, 1 = live ban.
+    int vac_live = -1;
     // Competitive cooldown from the account's own GC hello. -1 = unknown (leave as-is),
     // 0 = no cooldown, >0 = unix expiry.
     std::int64_t cooldown_expires_unix = -1;

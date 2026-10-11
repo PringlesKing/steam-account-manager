@@ -41,7 +41,7 @@ bool has_all_tags(const Account& a, const std::vector<std::string>& required) {
 }
 
 bool any_ban(const Account& a) {
-    return a.bans.vac_banned || a.bans.community_banned ||
+    return a.bans.vac_banned || a.cs2.vac_live || a.bans.community_banned ||
            a.bans.game_ban_count > 0 ||
            (a.bans.economy_ban == "banned" || a.bans.economy_ban == "probation");
 }
@@ -49,7 +49,7 @@ bool any_ban(const Account& a) {
 bool passes(const Account& a, const AccountFilter& f, const std::string& q_lower) {
     if (!matches_query(a, q_lower))      return false;
     if (!has_all_tags(a, f.required_tag_ids)) return false;
-    if (f.only_with_vac && !a.bans.vac_banned) return false;
+    if (f.only_with_vac && !(a.bans.vac_banned || a.cs2.vac_live)) return false;
     if (f.only_with_any_ban && !any_ban(a)) return false;
     if (f.only_with_sda && !a.sda.has_value()) return false;
     if (f.only_with_cooldown) {

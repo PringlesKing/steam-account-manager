@@ -121,7 +121,7 @@ struct CS2Status {
     int cs2_player_level = -1;             // "CS:GO Profile Rank" on accountmain
     int cs2_player_xp    = -1;             // XP earned towards next CS2 rank
     bool prime_status = false;             // inferred from cs2_player_level + xp
-    bool vac_live = false;                 // mirrors BanStatus.vac_banned
+    bool vac_live = false;                 // live CS2 GC vac_banned signal (can lead Web API)
     std::int64_t cooldown_expires_unix = 0;  // 0 = none, kCooldownNever = permanent
     std::string cooldown_reason;           // "Griefing", "Untrusted", "Team Damage", "Abandon"
     // Next weekly XP-drop reset (UTC s). "claimed" while now < this; auto-clears

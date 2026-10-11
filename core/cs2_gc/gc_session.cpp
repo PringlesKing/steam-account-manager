@@ -423,6 +423,10 @@ void GcSession::on_gc_message(std::uint32_t gc_emsg, const std::string& body) {
             if (h.account_id() != own) return;
             const auto now = static_cast<std::int64_t>(std::time(nullptr));
             const auto penalty_seconds = h.penalty_seconds();
+            own_penalty_.vac_live = h.has_vac_banned() ? (h.vac_banned() != 0 ? 1 : 0) : -1;
+            if (own_penalty_.vac_live >= 0) {
+                SAM_LOG_INFO("gc: own vac_banned={}", own_penalty_.vac_live);
+            }
 
             // penalty_seconds is a uint32. After a cooldown expires the GC can return a
             // wrapped value close to UINT32_MAX (effectively expiry-now underflow), not
@@ -455,6 +459,7 @@ void GcSession::on_gc_message(std::uint32_t gc_emsg, const std::string& body) {
                 r.level = a.player_level();
                 r.cur_xp = a.player_cur_xp();
                 r.bonus_flags = a.player_xp_bonus_flags();
+                if (a.has_vac_banned()) r.vac_live = a.vac_banned() != 0 ? 1 : 0;
                 if (a.has_medals()) {
                     r.featured_medal_defidx = a.medals().featured_display_item_defidx();
                     r.medal_defidx.assign(a.medals().display_items_defidx().begin(),
@@ -479,6 +484,7 @@ void GcSession::on_gc_message(std::uint32_t gc_emsg, const std::string& body) {
                     player_xp_.medal_defidx = r.medal_defidx;
                     player_xp_.valid = true;
 
+                    if (own_penalty_.vac_live >= 0) r.vac_live = own_penalty_.vac_live;
                     if (own_penalty_.seen) {
                         r.cooldown_expires_unix = own_penalty_.expires;
                         r.cooldown_reason =

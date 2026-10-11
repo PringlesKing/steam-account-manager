@@ -108,8 +108,8 @@ void draw_ban_pills(const core::BanStatus& b, const BanPillsOptions& opts) {
         set_tooltip("%s", community_tip(b).c_str());
     }
     if (opts.show_vac_live && opts.vac_live && pill("VAC-LIVE", red, true)) {
-        set_tooltip("VAC ban reported by the CS2 Game Coordinator. Usually shows "
-                    "before the Web API's VAC flag.");
+        set_tooltip("Live ban/restriction reported by the CS2 Game Coordinator "
+                    "(vac_banned). It can appear before Steam's public VAC/Game-ban data.");
     }
 }
 

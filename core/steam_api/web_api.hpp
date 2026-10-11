@@ -23,7 +23,8 @@ http::Response get(const WebApiConfig& cfg,
                    const std::string& method,
                    const std::string& version,
                    std::map<std::string, std::string> params,
-                   bool api_key_required = true);
+                   bool api_key_required = true,
+                   bool bypass_cache = false);
 
 // SteamID-shaped JSON value, accepting both numeric and string forms. 0 on failure.
 inline std::uint64_t parse_u64(const nlohmann::json& j) {

@@ -57,6 +57,9 @@ struct ProfileResult {
     int premier_wins = -1;
     int wingman_rank = -1;
     int wingman_wins = -1;
+    // Live VAC/game restriction bit from MatchmakingGC2ClientHello::vac_banned.
+    // -1 = unknown, 0 = clear, 1 = the GC reports the account as banned.
+    int vac_live = -1;
     // Competitive cooldown from the account's OWN GC hello (MatchmakingGC2ClientHello).
     // -1 = unknown (foreign profiles / not yet seen), 0 = no cooldown, >0 = unix expiry.
     std::int64_t cooldown_expires_unix = -1;
@@ -148,10 +151,12 @@ private:
     PlayerXp player_xp_;
     // The own account's competitive cooldown, captured from the unsolicited
     // MatchmakingGC2ClientHello the GC sends at connect. `seen` gates whether we have an
-    // authoritative value; `expires` is 0 (no cooldown) or a unix expiry.
+    // authoritative value; `expires` is 0 (no cooldown) or a unix expiry. The same hello
+    // also contains the live vac_banned bit, which can lead the public Web API.
     struct OwnPenalty {
         bool seen = false;
         std::int64_t expires = 0;
+        int vac_live = -1;
     } own_penalty_;
     std::deque<ProfileResult> profile_results_;  // ClientRequestPlayersProfile replies, FIFO
     RecurringMission recurring_mission_;

@@ -14,6 +14,7 @@
 #include "core/launch/first_login_reapply.hpp"
 #include "core/log.hpp"
 #include "core/steam_api/ban_check.hpp"
+#include "core/steam_bans/private_ban.hpp"
 #include "core/steam_api/summaries.hpp"
 #include "core/steam_gcpd/gcpd_parser.hpp"
 #include "core/steam_gcpd/gcpd_scraper.hpp"
@@ -114,6 +115,21 @@ void AppState::refresh_account_data(bool force, bool announce) {
         ids.push_back(a.steam_id_64);
     }
 
+    // Newly-applied VAC/game bans can lag in the public GetPlayerBans API while the
+    // affected account is still the active Steam client session. Refresh All therefore
+    // also probes the active account's authenticated Steam Support ban page, even when
+    // its normal Web API cache entry is still fresh.
+    std::optional<core::Account> active_private_ban_creds;
+    if (const auto au = platform::registry::read_active_user(); au && *au != 0) {
+        for (const auto& a : vault.accounts) {
+            if (a.steam_id_64 == 0 || a.is_nfa) continue;
+            if (static_cast<std::uint32_t>(a.steam_id_64 & 0xffffffffULL) != *au) continue;
+            if (a.session_id.empty() || a.steam_login_secure.empty()) break;
+            active_private_ban_creds = a;
+            break;
+        }
+    }
+
     std::vector<std::string> gcpd_ids;
     if (settings.gcpd_enabled) {
         for (const auto& a : vault.accounts) {
@@ -136,7 +152,8 @@ void AppState::refresh_account_data(bool force, bool announce) {
         nfa_ids = collect_nfa_validate_ids(force);
     }
 
-    if (ids.empty() && gcpd_ids.empty() && nfa_ids.empty()) {
+    if (ids.empty() && gcpd_ids.empty() && nfa_ids.empty() &&
+        !active_private_ban_creds.has_value()) {
         SAM_LOG_INFO("refresh_all: everything within the cache window");
         if (announce) toasts.push_summary("All accounts are up to date");
         refresh_web_phase_done.store(true, std::memory_order_relaxed);
@@ -144,8 +161,9 @@ void AppState::refresh_account_data(bool force, bool announce) {
         return;
     }
 
-    SAM_LOG_INFO("refresh_all: steam={} gcpd={} nfa={} accounts", ids.size(), gcpd_ids.size(),
-                 nfa_ids.size());
+    SAM_LOG_INFO("refresh_all: steam={} gcpd={} nfa={} active_private={} accounts",
+                 ids.size(), gcpd_ids.size(), nfa_ids.size(),
+                 active_private_ban_creds.has_value());
 
     refresh_all_total.store(static_cast<int>(gcpd_ids.size() + nfa_ids.size()),
                             std::memory_order_relaxed);
@@ -155,8 +173,7 @@ void AppState::refresh_account_data(bool force, bool announce) {
 
     if (!nfa_ids.empty()) start_gc_validate_feed(std::move(nfa_ids));
 
-    if (ids.empty()) {
-
+    if (ids.empty() && !active_private_ban_creds.has_value()) {
         refresh_web_phase_done.store(true, std::memory_order_relaxed);
         post_gcpd_sweep(std::move(gcpd_ids));
         return;
@@ -166,23 +183,51 @@ void AppState::refresh_account_data(bool force, bool announce) {
     steam_api::WebApiConfig cfg;
     cfg.api_key = settings.web_api_key;
 
-    job_pump::submit([cfg, ids, gcpd_ids, this] {
+    job_pump::submit([cfg, ids, gcpd_ids, active_private_ban_creds, this]() mutable {
         auto bans = steam_api::fetch_bans(cfg, ids);
         auto summaries = steam_api::fetch_summaries(cfg, ids);
+
+        std::optional<steam_bans::PrivateBanStatus> active_private_bans;
+        std::string active_private_aid;
+        if (active_private_ban_creds) {
+            http::ScopedProxy proxy_guard(std::string(active_private_ban_creds->proxy.begin(),
+                                                      active_private_ban_creds->proxy.end()));
+            auto pb = steam_bans::fetch_private_bans(*active_private_ban_creds);
+            if (pb.ok) {
+                active_private_bans = std::move(pb);
+                active_private_aid = active_private_ban_creds->id;
+            }
+        }
 
         std::lock_guard lk(job_mutex);
         completed_jobs.push_back({"", [this, gcpd_ids,
                                        bans = std::move(bans),
-                                       summaries = std::move(summaries)] {
+                                       summaries = std::move(summaries),
+                                       active_private_bans = std::move(active_private_bans),
+                                       active_private_aid = std::move(active_private_aid)] {
             const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             int accounts_with_events = 0;
             std::vector<std::pair<std::string, std::vector<core::BanEvent>>> per_account_events;
             for (auto& a : vault.accounts) {
                 if (a.steam_id_64 == 0) continue;
-                const bool bans_changed = bans.find(a.steam_id_64) != bans.end();
+                bool bans_changed = bans.find(a.steam_id_64) != bans.end();
                 if (auto it = bans.find(a.steam_id_64); it != bans.end())
                     a.bans = it->second;
+                if (active_private_bans && a.id == active_private_aid) {
+                    if (!active_private_bans->good_standing) {
+                        if (active_private_bans->vac_banned) {
+                            a.bans.vac_banned = true;
+                            a.bans.vac_ban_count = std::max(a.bans.vac_ban_count, 1);
+                        }
+                        if (active_private_bans->game_ban_count > 0) {
+                            a.bans.game_ban_count = std::max(
+                                a.bans.game_ban_count, active_private_bans->game_ban_count);
+                        }
+                    }
+                    a.bans.last_refreshed_unix = now;
+                    bans_changed = true;
+                }
                 if (auto it = summaries.find(a.steam_id_64); it != summaries.end()) {
                     a.web.persona_name = it->second.persona_name;
                     a.web.profile_url = it->second.profile_url;
@@ -360,6 +405,7 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
         bool nfa_token_dead = false;
         std::optional<steam_gcpd::MatchmakingData> mm_parsed;
         std::optional<steam_gcpd::AccountMainData> am_parsed;
+        std::optional<steam_bans::PrivateBanStatus> private_bans;
 
         if (is_nfa) {
             const std::int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
@@ -468,7 +514,18 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
             }
         }
 
-        const bool gcpd_creds_ok = !creds.session_id.empty() && !creds.steam_login_secure.empty();
+        const bool web_session_ok = !creds.session_id.empty() && !creds.steam_login_secure.empty();
+
+        // GetPlayerBans can lag a newly-applied CS2 VAC/game restriction until the active
+        // Steam session is logged out. Steam Support's authenticated VAC/Game Bans page is
+        // account-private and reflects that state earlier, so use it as a positive fallback.
+        // This is the same page opened by Steam Settings -> Account -> VAC Status -> Learn More.
+        if (!need_relogin && web_session_ok) {
+            auto pb = steam_bans::fetch_private_bans(creds);
+            if (pb.ok) private_bans = std::move(pb);
+        }
+
+        const bool gcpd_creds_ok = web_session_ok;
         if (gcpd_enabled && gcpd_creds_ok) {
 
             auto run_tab = [&](steam_gcpd::Tab tab, auto parser) {
@@ -533,6 +590,7 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
                                        level, games,
                                        mm_parsed = std::move(mm_parsed),
                                        am_parsed = std::move(am_parsed),
+                                       private_bans = std::move(private_bans),
                                        token_refreshed, nfa_token_dead,
                                        refreshed_at = std::move(refreshed_at),
                                        refreshed_rt = std::move(refreshed_rt),
@@ -551,8 +609,51 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
                 a->access_token_expires = refreshed_exp;
                 if (!refreshed_sid.empty()) a->session_id = refreshed_sid;
             }
-            if (auto it = bans.find(resolved); it != bans.end())
+            const bool public_bans_arrived = bans.find(resolved) != bans.end();
+            const core::BanStatus previous_bans = a->bans;
+            if (auto it = bans.find(resolved); it != bans.end()) {
                 a->bans = it->second;
+            }
+
+            bool private_ban_positive = false;
+            if (private_bans && private_bans->ok) {
+                if (private_bans->good_standing) {
+                    // The private page explicitly says no VAC/game bans. Only use that to
+                    // clear those fields when the public API does not simultaneously report
+                    // a ban; positive evidence from either source always wins.
+                    if (!a->bans.vac_banned && a->bans.vac_ban_count == 0 &&
+                        a->bans.game_ban_count == 0) {
+                        a->bans.vac_banned = false;
+                        a->bans.vac_ban_count = 0;
+                        a->bans.game_ban_count = 0;
+                    }
+                } else {
+                    if (private_bans->vac_banned) {
+                        a->bans.vac_banned = true;
+                        a->bans.vac_ban_count = std::max(a->bans.vac_ban_count, 1);
+                        private_ban_positive = true;
+                    }
+                    if (private_bans->game_ban_count > 0) {
+                        a->bans.game_ban_count =
+                            std::max(a->bans.game_ban_count, private_bans->game_ban_count);
+                        private_ban_positive = true;
+                    }
+                }
+                a->bans.last_refreshed_unix = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            } else if (public_bans_arrived) {
+                // If the private check temporarily failed, never let a lagging public API
+                // erase a ban we already observed. A later successful private check or a
+                // caught-up public response will reconcile the value.
+                if (previous_bans.vac_banned && !a->bans.vac_banned) {
+                    a->bans.vac_banned = true;
+                    a->bans.vac_ban_count =
+                        std::max(a->bans.vac_ban_count, previous_bans.vac_ban_count);
+                }
+                if (previous_bans.game_ban_count > a->bans.game_ban_count) {
+                    a->bans.game_ban_count = previous_bans.game_ban_count;
+                }
+            }
             if (auto it = summaries.find(resolved); it != summaries.end()) {
                 a->web.persona_name = it->second.persona_name;
                 a->web.profile_url = it->second.profile_url;
@@ -577,7 +678,8 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
                 if (mm_parsed->wingman_wins  >= 0) a->cs2.wingman_wins   = mm_parsed->wingman_wins;
                 a->cs2.cooldown_expires_unix = mm_parsed->cooldown_expires_unix;
                 a->cs2.cooldown_reason       = mm_parsed->cooldown_reason;
-                a->cs2.vac_live              = a->bans.vac_banned;
+                // VAC-Live is sourced from the CS2 GC itself. Do not overwrite it
+                // with the potentially-lagging public Web API ban flag here.
                 cs2_touched = true;
             }
             if (am_parsed && am_parsed->ok) {
@@ -602,7 +704,8 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
             }
             last_refresh_unix[aid] = now_unix;
 
-            const bool bans_arrived = bans.find(resolved) != bans.end();
+            const bool bans_arrived = public_bans_arrived || private_ban_positive ||
+                                      (private_bans && private_bans->ok);
             if (bans_arrived || cs2_touched) {
                 auto evs = apply_diff_and_snapshot(*this, *a, a->bans, a->cs2, now_unix);
                 if (!evs.empty()) {

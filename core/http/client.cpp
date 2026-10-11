@@ -174,17 +174,21 @@ bool split_url(const std::string& url, std::wstring& host, INTERNET_PORT& port,
     const std::wstring wurl = to_wide(url);
     URL_COMPONENTSW c{};
     c.dwStructSize = sizeof(c);
-    wchar_t host_buf[256] = {};
-    wchar_t path_buf[2048] = {};
-    c.lpszHostName = host_buf;
-    c.dwHostNameLength = _countof(host_buf);
-    c.lpszUrlPath = path_buf;
-    c.dwUrlPathLength = _countof(path_buf);
+
+    // Ask WinHTTP for pointers into `wurl` instead of copying into fixed buffers.
+    // GetPlayerBans/GetPlayerSummaries with 100 SteamIDs can exceed 2048 chars;
+    // the old path_buf[2048] made WinHttpCrackUrl fail with ERROR_INSUFFICIENT_BUFFER
+    // and surfaced as `status 0 (malformed url)`. Keep dwExtraInfoLength == 0 so
+    // the query string is included in lpszUrlPath, matching the old behavior.
     c.dwSchemeLength = static_cast<DWORD>(-1);
+    c.dwHostNameLength = static_cast<DWORD>(-1);
+    c.dwUrlPathLength = static_cast<DWORD>(-1);
 
     if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &c)) return false;
-    host = std::wstring(c.lpszHostName, c.dwHostNameLength);
-    path = std::wstring(c.lpszUrlPath, c.dwUrlPathLength);
+    if (!c.lpszHostName || !c.lpszUrlPath) return false;
+
+    host.assign(c.lpszHostName, c.dwHostNameLength);
+    path.assign(c.lpszUrlPath, c.dwUrlPathLength);
     if (path.empty()) path = L"/";
     port = c.nPort;
     https = c.nScheme == INTERNET_SCHEME_HTTPS;
@@ -255,7 +259,8 @@ Response perform_once(const Request& req) {
         return out;
     }
 
-    const DWORD open_flags = https ? WINHTTP_FLAG_SECURE : 0;
+    DWORD open_flags = https ? WINHTTP_FLAG_SECURE : 0;
+    if (req.bypass_cache) open_flags |= WINHTTP_FLAG_REFRESH;
     HINTERNET request = WinHttpOpenRequest(conn,
                                             method_w(req.method),
                                             path.c_str(),

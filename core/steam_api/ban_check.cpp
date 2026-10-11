@@ -42,11 +42,14 @@ std::unordered_map<std::uint64_t, core::BanStatus> fetch_bans(
     SAM_LOG_INFO("ban_check: fetching for {} ids", steam_ids.size());
     const std::int64_t now = now_seconds();
 
-    for (std::size_t off = 0; off < steam_ids.size(); off += 100) {
-        const std::size_t batch = std::min<std::size_t>(100, steam_ids.size() - off);
+    // Keep ban requests comfortably below common proxy URL limits. The API supports
+    // batches, but encoded 100-ID URLs are >2 KB and used to trip our old URL parser.
+    constexpr std::size_t kBatchSize = 50;
+    for (std::size_t off = 0; off < steam_ids.size(); off += kBatchSize) {
+        const std::size_t batch = std::min<std::size_t>(kBatchSize, steam_ids.size() - off);
         std::map<std::string, std::string> params{{"steamids", join_ids(steam_ids, off, batch)}};
 
-        const auto resp = get(cfg, "ISteamUser", "GetPlayerBans", "v1", params, true);
+        const auto resp = get(cfg, "ISteamUser", "GetPlayerBans", "v1", params, true, true);
         if (resp.status != 200) {
             SAM_LOG_WARN("ban_check: status {} ({})", resp.status, resp.error_message);
             continue;

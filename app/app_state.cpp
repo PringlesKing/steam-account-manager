@@ -177,6 +177,14 @@ void AppState::apply_gc_snapshot_cache(const std::string& account_id,
         acc->cs2.wingman_rank = rk.wingman_rank;
         acc->cs2.wingman_wins = rk.wingman_wins;
     }
+    if (rk.vac_live >= 0) {
+        const bool was = acc->cs2.vac_live;
+        acc->cs2.vac_live = rk.vac_live != 0;
+        if (was != acc->cs2.vac_live) {
+            SAM_LOG_INFO("gc-cache: '{}' VAC-Live {} -> {}", acc->login, was,
+                         acc->cs2.vac_live);
+        }
+    }
 
     if (rk.cooldown_expires_unix >= 0) {
         // Defense in depth: never persist an ordinary temporary cooldown hundreds of

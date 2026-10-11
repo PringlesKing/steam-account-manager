@@ -38,6 +38,9 @@ struct Request {
         "Mozilla/5.0 (Linux; U; Android 9; en-US; "
         "SM-G973U) Valve Steam App Version/3.6.4";
     bool follow_redirects = true;
+    // Force revalidation at proxies/CDNs. WinHTTP adds Pragma/Cache-Control no-cache
+    // via WINHTTP_FLAG_REFRESH. Useful for state that can change seconds ago, e.g. bans.
+    bool bypass_cache = false;
     int max_retries = 2;
 };
 

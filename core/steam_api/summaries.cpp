@@ -41,8 +41,9 @@ std::unordered_map<std::uint64_t, core::WebProfile> fetch_summaries(
     SAM_LOG_INFO("summaries: fetching for {} ids", steam_ids.size());
     const std::int64_t now = now_seconds();
 
-    for (std::size_t off = 0; off < steam_ids.size(); off += 100) {
-        const std::size_t batch = std::min<std::size_t>(100, steam_ids.size() - off);
+    constexpr std::size_t kBatchSize = 50;
+    for (std::size_t off = 0; off < steam_ids.size(); off += kBatchSize) {
+        const std::size_t batch = std::min<std::size_t>(kBatchSize, steam_ids.size() - off);
         std::map<std::string, std::string> params{
             {"steamids", join_ids(steam_ids, off, batch)},
         };
