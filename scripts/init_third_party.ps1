@@ -98,7 +98,7 @@ function Ensure-SingleFile {
 
 Ensure-GitClone -Name "imgui" `
     -Url "https://github.com/ocornut/imgui.git" `
-    -Tag "docking" `
+    -Tag "v1.92.9b-docking" `
     -Shallow
 
 Ensure-GitClone -Name "mbedtls" `
