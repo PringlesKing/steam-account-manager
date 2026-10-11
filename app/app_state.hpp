@@ -86,21 +86,25 @@ struct GcAutoPull {
     std::chrono::steady_clock::time_point phase_started{};
 };
 
-// Per-account GC connect that validates an NFA/cached token (via the CM logon result) and
-// pulls that account's OWN CS2 profile (ranks/medals/level/cooldown/vac). Processes a queue
-// one account at a time, staggered and TTL-gated so it never trips Steam's rate limiter.
+// Per-account GC connect that pulls each account's OWN CS2 profile
+// (ranks/medals/level/cooldown/vac). This is deliberately own-session: Valve's foreign-profile
+// request is friend/online gated and cannot be used as a reliable bulk refresh for arbitrary
+// vault accounts. Full-access accounts can mint a client token from the stored password when
+// needed; NFA/cached accounts use their imported client token. The queue is processed one at
+// a time and staggered to stay gentle on Steam/GC.
 // tick_gc_validate() advances it each frame.
 struct GcValidate {
     bool active = false;
     std::string status;  // progress text for the UI
-    std::vector<std::string> queue;  // vault ids to process (NFA/cached with a client token)
+    std::vector<std::string> queue;  // vault ids to process via their own GC session
     std::size_t idx = 0;
     int done = 0;  // finished (progress numerator)
 
     std::string current_id;
     std::uint32_t current_account_id = 0;  // 32-bit, matches on_profile
     std::unique_ptr<cs2_gc::Cs2GcClient> client;
-    bool connected = false;      // puller posted on_status == "Ready"
+    bool signin_pending = false; // full-access acquire_cm_token call outstanding
+    bool connected = false;      // client posted on_status == "Ready"
     bool pull_issued = false;    // own-profile pull_profiles sent
     bool logon_seen = false;     // on_logon fired
     int logon_eresult = 0;       // CM logon EResult (1 = OK)
@@ -384,15 +388,13 @@ struct AppState {
     void auto_refresh_all();
 
     // "Refresh GC": pull CS2 GC profile data (level/XP, medals, ranks, cooldown) for every
-    // account: one puller batch-pulls full-access foreign profiles, NFA/cached each get their
-    // own-session login. Both TTL-gated. `announce` shows an "up to date" toast when nothing is
-    // stale (manual button); startup/auto pass false.
+    // account by connecting as that account. This is TTL-gated. Full-access accounts mint a
+    // client token from the stored password when needed; NFA/cached accounts use their imported
+    // token. `announce` shows an "up to date" toast when nothing is stale.
     void refresh_gc_all(bool announce = false);
 
-    // Same GC refresh as refresh_gc_all(), but limits the accounts whose GC data is
-    // updated to `account_ids`. A puller account outside the set may still be used as the
-    // transport connection; its profile is not refreshed unless it is also in the set.
-    // Cache TTLs are respected, matching the toolbar "Refresh GC" action.
+    // Same own-session GC refresh as refresh_gc_all(), but limits the accounts whose GC data
+    // is updated to `account_ids`. Cache TTLs are respected, matching the toolbar action.
     void refresh_gc_accounts(const std::vector<std::string>& account_ids,
                              bool announce = false);
 

@@ -72,7 +72,8 @@ void advance_validate(AppState& st);
 void end_validate(AppState& st, std::string status);
 constexpr auto kValidateTimeout = std::chrono::seconds(90);
 
-constexpr auto kValidateStagger = std::chrono::seconds(15);
+constexpr auto kValidateStagger = std::chrono::seconds(3);
+constexpr auto kValidateSigninStagger = std::chrono::seconds(15);
 
 std::vector<std::string> build_puller_candidates(const AppState& st, std::int64_t now) {
     std::vector<std::string> full_ready;
@@ -214,13 +215,20 @@ void end_autopull(GcAutoPull& g, std::string status) {
 
 void begin_validate(AppState& st) {
     GcValidate& v = st.gc_validate;
+    if (v.idx >= v.queue.size()) {
+        end_validate(st, "GC refresh: done");
+        return;
+    }
+
     core::Account* a = st.find_account(v.queue[v.idx]);
     if (a == nullptr) {
         advance_validate(st);
         return;
     }
+
     v.current_id = a->id;
     v.current_account_id = static_cast<std::uint32_t>(a->steam_id_64 & 0xffffffffULL);
+    v.signin_pending = false;
     v.connected = false;
     v.pull_issued = false;
     v.logon_seen = false;
@@ -228,28 +236,74 @@ void begin_validate(AppState& st) {
     v.profile_applied = false;
     v.finished = false;
     v.phase_started = steady_clock::now();
-    v.status = "Validating " + a->login;
-    SAM_LOG_INFO("gc-validate: connecting as '{}'", a->login);
+
+    // Full-access accounts can acquire a fresh client-audience token on demand. The old
+    // bulk puller tried to query unrelated accounts through one GC session, but Valve gates
+    // foreign profile requests (friend/online), so arbitrary vault accounts returned 0/N.
+    if (!a->is_nfa && needs_signin(*a, now_unix())) {
+        if (a->login.empty() || a->password.empty()) {
+            SAM_LOG_WARN("gc-validate: skipping '{}' (no usable client token/password)",
+                         a->login);
+            advance_validate(st);
+            return;
+        }
+
+        const std::string aid = a->id;
+        v.signin_pending = true;
+        v.status = "Signing in for GC " + a->login;
+        SAM_LOG_INFO("gc-validate: acquiring client token for '{}'", a->login);
+
+        AppState* stp = &st;
+        st.acquire_cm_token(aid, [stp, aid](bool ok, std::string err) {
+            GcValidate& v = stp->gc_validate;
+            if (!v.active || v.current_id != aid || !v.signin_pending) return;
+            v.signin_pending = false;
+
+            if (!ok) {
+                SAM_LOG_WARN("gc-validate: client-token sign-in failed for '{}': {}",
+                             aid, err);
+                advance_validate(*stp);
+                return;
+            }
+
+            SAM_LOG_INFO("gc-validate: client token ready for '{}'", aid);
+            // Re-enter for the same queue item; this time needs_signin() should be false.
+            begin_validate(*stp);
+        });
+        return;
+    }
+
+    const std::string token = cs2_client_token(*a);
+    if (token.empty()) {
+        SAM_LOG_WARN("gc-validate: skipping '{}' (no client token)", a->login);
+        advance_validate(st);
+        return;
+    }
+
+    v.status = "Refreshing GC " + a->login;
+    SAM_LOG_INFO("gc-validate: connecting as '{}' ({}/{})", a->login,
+                 v.idx + 1, v.queue.size());
 
     cs2_gc::Cs2Credentials creds;
-    creds.refresh_token = cs2_client_token(*a);
+    creds.refresh_token = token;
     creds.steam_id = a->steam_id_64;
     creds.proxy = std::string(a->proxy.begin(), a->proxy.end());
 
+    const std::string current_aid = a->id;
     AppState* stp = &st;
     cs2_gc::Cs2Callbacks cb;
-    cb.on_logon = [stp](int eresult) {
-        stp->post_ui_callback([stp, eresult] {
+    cb.on_logon = [stp, current_aid](int eresult) {
+        stp->post_ui_callback([stp, current_aid, eresult] {
             GcValidate& v = stp->gc_validate;
-            if (!v.active) return;
+            if (!v.active || v.current_id != current_aid) return;
             v.logon_seen = true;
             v.logon_eresult = eresult;
         });
     };
-    cb.on_status = [stp](std::string text) {
-        stp->post_ui_callback([stp, text = std::move(text)] {
+    cb.on_status = [stp, current_aid](std::string text) {
+        stp->post_ui_callback([stp, current_aid, text = std::move(text)] {
             GcValidate& v = stp->gc_validate;
-            if (!v.active) return;
+            if (!v.active || v.current_id != current_aid) return;
             if (text == "Ready") v.connected = true;
         });
     };
@@ -264,19 +318,24 @@ void begin_validate(AppState& st) {
             snap.ranks = pp.ranks;
             stp->apply_gc_snapshot_cache(v.current_id, snap);
             v.profile_applied = true;
+            SAM_LOG_INFO("gc-validate: profile applied for '{}' (account_id={})",
+                         v.current_id, pp.account_id);
         });
     };
-    cb.on_profiles_done = [stp](int, int) {
-        stp->post_ui_callback([stp] {
+    cb.on_profiles_done = [stp, current_aid](int received, int requested) {
+        stp->post_ui_callback([stp, current_aid, received, requested] {
             GcValidate& v = stp->gc_validate;
-            if (v.active) v.finished = true;
+            if (!v.active || v.current_id != current_aid) return;
+            SAM_LOG_INFO("gc-validate: own-profile request {}/{} for '{}'",
+                         received, requested, v.current_id);
+            v.finished = true;
         });
     };
-    cb.on_error = [stp](std::string err) {
-        stp->post_ui_callback([stp, err = std::move(err)] {
+    cb.on_error = [stp, current_aid](std::string err) {
+        stp->post_ui_callback([stp, current_aid, err = std::move(err)] {
             GcValidate& v = stp->gc_validate;
-            if (!v.active) return;
-            SAM_LOG_WARN("gc-validate: error: {}", err);
+            if (!v.active || v.current_id != current_aid) return;
+            SAM_LOG_WARN("gc-validate: error for '{}': {}", v.current_id, err);
             v.finished = true;
         });
     };
@@ -286,6 +345,7 @@ void begin_validate(AppState& st) {
 void advance_validate(AppState& st) {
     GcValidate& v = st.gc_validate;
     if (v.client) cs2_gc::retire(std::move(v.client));
+    v.signin_pending = false;
     v.connected = false;
     v.pull_issued = false;
     ++v.done;
@@ -299,15 +359,23 @@ void advance_validate(AppState& st) {
         }
     }
     if (v.idx >= v.queue.size()) {
-        end_validate(st, "NFA validate: done");
+        end_validate(st, "GC refresh: done");
         return;
     }
-    v.resume_at = steady_clock::now() + kValidateStagger;
+
+    auto delay = kValidateStagger;
+    if (core::Account* next = st.find_account(v.queue[v.idx]);
+        next != nullptr && !next->is_nfa && needs_signin(*next, now_unix())) {
+        // Credential auth is much easier to rate-limit than an already-tokenized CM login.
+        delay = kValidateSigninStagger;
+    }
+    v.resume_at = steady_clock::now() + delay;
 }
 
 void end_validate(AppState& st, std::string status) {
     GcValidate& v = st.gc_validate;
     if (v.client) cs2_gc::retire(std::move(v.client));
+    v.signin_pending = false;
     v.active = false;
     v.status = std::move(status);
     SAM_LOG_INFO("gc-validate: {} ({} processed)", v.status, v.done);
@@ -325,6 +393,52 @@ std::string cs2_client_token(const core::Account& a) {
 }
 
 namespace {
+
+std::vector<std::string> collect_gc_refresh_ids(
+    const AppState& st, const std::unordered_set<std::string>* allowed_ids) {
+    const std::int64_t now = now_unix();
+    const int hours = std::clamp(st.settings.cs2_gc.cache_hours, 1, 24);
+    const std::int64_t ttl = static_cast<std::int64_t>(hours) * 3600;
+
+    std::vector<std::string> out;
+    out.reserve(allowed_ids != nullptr ? allowed_ids->size() : st.vault.accounts.size());
+
+    int fresh = 0;
+    int no_auth = 0;
+    int unavailable = 0;
+    for (const auto& a : st.vault.accounts) {
+        if (allowed_ids != nullptr && allowed_ids->count(a.id) == 0) continue;
+        if (a.steam_id_64 == 0) {
+            ++unavailable;
+            continue;
+        }
+        if (is_active_steam_user(a) || is_manually_connected(st, a.id)) {
+            ++unavailable;
+            continue;
+        }
+        if (a.cs2.gc_last_pulled_unix != 0 && now - a.cs2.gc_last_pulled_unix < ttl) {
+            ++fresh;
+            continue;
+        }
+
+        const std::string token = cs2_client_token(a);
+        if (a.is_nfa) {
+            if (token.empty()) {
+                ++no_auth;
+                continue;
+            }
+        } else if (needs_signin(a, now) && (a.login.empty() || a.password.empty())) {
+            ++no_auth;
+            continue;
+        }
+
+        out.push_back(a.id);
+    }
+
+    SAM_LOG_INFO("gc-refresh: own-session selection queued={} fresh={} no_auth={} unavailable={}",
+                 out.size(), fresh, no_auth, unavailable);
+    return out;
+}
 
 void start_gc_autopull_impl(AppState& st, const std::unordered_set<std::string>* allowed_ids) {
     if (st.gc_autopull.active) return;
@@ -516,7 +630,9 @@ void AppState::queue_gc_validate(const std::string& account_id) {
     core::Account* a = find_account(account_id);
     if (a == nullptr || a->steam_id_64 == 0) return;
 
-    if (cs2_client_token(*a).empty()) return;
+    const std::string token = cs2_client_token(*a);
+    if (a->is_nfa && token.empty()) return;
+    if (!a->is_nfa && token.empty() && (a->login.empty() || a->password.empty())) return;
     if (is_active_steam_user(*a) || is_manually_connected(*this, account_id)) return;
     if (gc_validate.active) {
         for (const auto& id : gc_validate.queue)
@@ -535,6 +651,15 @@ void AppState::tick_gc_validate() {
     GcValidate& v = gc_validate;
     if (!v.active) return;
     const auto now = steady_clock::now();
+
+    if (v.signin_pending) {
+        if (now - v.phase_started > kSigninTimeout) {
+            SAM_LOG_WARN("gc-validate: client-token sign-in timed out for '{}'", v.current_id);
+            v.signin_pending = false;
+            advance_validate(*this);
+        }
+        return;
+    }
 
     if (!v.client) {
         if (now >= v.resume_at) begin_validate(*this);
@@ -593,20 +718,24 @@ void AppState::cancel_gc_validate() {
     if (!gc_validate.active && !gc_validate.client) return;
     if (gc_validate.client) cs2_gc::retire(std::move(gc_validate.client));
     gc_validate.active = false;
-    gc_validate.status = "NFA validate stopped";
+    gc_validate.status = "GC refresh stopped";
     SAM_LOG_INFO("gc-validate: cancelled");
 }
 
 void AppState::refresh_gc_all(bool announce) {
     if (!settings.cs2_gc.enabled) return;
+    if (gc_autopull.active || gc_validate.active) {
+        SAM_LOG_INFO("gc-refresh: request ignored because a GC refresh is already running");
+        return;
+    }
 
-    start_gc_autopull();
-    start_gc_validate(false);
+    std::vector<std::string> ids = collect_gc_refresh_ids(*this, nullptr);
+    start_gc_validate_ids(std::move(ids));
 
-    if (announce && !gc_autopull.active && !gc_validate.active) {
+    if (announce && !gc_validate.active) {
         ui::widgets::ToastItem t;
         t.id = "refresh-gc-uptodate";
-        t.message = "GC data is up to date for all accounts";
+        t.message = "GC data is up to date (or unavailable) for all accounts";
         t.is_warning = true;
         t.expires_at_unix = now_unix() + settings.notifications.toast_duration_seconds;
         toasts.push(std::move(t));
@@ -616,33 +745,20 @@ void AppState::refresh_gc_all(bool announce) {
 void AppState::refresh_gc_accounts(const std::vector<std::string>& account_ids, bool announce) {
     if (!settings.cs2_gc.enabled || account_ids.empty()) return;
 
-    // Do not splice a group request into an in-flight global/group request: that would make
-    // the target set ambiguous. The group menu is disabled while either worker is active,
-    // but keep this guard for non-UI callers too.
-    if (gc_autopull.active || gc_validate.active) return;
+    if (gc_autopull.active || gc_validate.active) {
+        SAM_LOG_INFO("gc-refresh: group request ignored because a GC refresh is already running");
+        return;
+    }
 
     const std::unordered_set<std::string> allowed(account_ids.begin(), account_ids.end());
-    start_gc_autopull_impl(*this, &allowed);
+    std::vector<std::string> ids = collect_gc_refresh_ids(*this, &allowed);
+    SAM_LOG_INFO("gc-refresh: group requested={} queued={}", account_ids.size(), ids.size());
+    start_gc_validate_ids(std::move(ids));
 
-    const std::int64_t now = now_unix();
-    const int hours = std::clamp(settings.cs2_gc.cache_hours, 1, 24);
-    const std::int64_t ttl = static_cast<std::int64_t>(hours) * 3600;
-    std::vector<std::string> nfa_ids;
-    nfa_ids.reserve(account_ids.size());
-    for (const auto& a : vault.accounts) {
-        if (allowed.count(a.id) == 0) continue;
-        if (!a.is_nfa || a.steam_id_64 == 0) continue;
-        if (cs2_client_token(a).empty()) continue;
-        if (is_active_steam_user(a) || is_manually_connected(*this, a.id)) continue;
-        if (a.nfa_last_validated_unix != 0 && now - a.nfa_last_validated_unix < ttl) continue;
-        nfa_ids.push_back(a.id);
-    }
-    start_gc_validate_ids(std::move(nfa_ids));
-
-    if (announce && !gc_autopull.active && !gc_validate.active) {
+    if (announce && !gc_validate.active) {
         ui::widgets::ToastItem t;
         t.id = "refresh-gc-group-uptodate";
-        t.message = "GC data is up to date for this group";
+        t.message = "GC data is up to date (or unavailable) for this group";
         t.is_warning = true;
         t.expires_at_unix = now_unix() + settings.notifications.toast_duration_seconds;
         toasts.push(std::move(t));

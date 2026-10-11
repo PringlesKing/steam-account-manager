@@ -661,8 +661,9 @@ void draw_import_mafile(app::AppState& state) {
             if (account_ids.size() == 1) {
                 state.pull_all_for_account(account_ids.front());
             } else if (!account_ids.empty()) {
+                const auto gc_ids = account_ids;
                 state.refresh_accounts_staggered(std::move(account_ids));
-                state.start_gc_autopull();
+                state.refresh_gc_accounts(gc_ids, false);
             }
             has_summary = true;
 
@@ -831,8 +832,9 @@ void draw_import_info_dat(app::AppState& state) {
             if (all_ids.size() == 1) {
                 state.pull_all_for_account(all_ids.front());
             } else if (!all_ids.empty()) {
+                const auto gc_ids = all_ids;
                 state.refresh_accounts_staggered(std::move(all_ids));
-                state.start_gc_autopull();
+                state.refresh_gc_accounts(gc_ids, false);
             }
             has_summary = true;
 

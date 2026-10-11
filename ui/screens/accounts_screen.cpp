@@ -432,8 +432,12 @@ void draw_accounts(app::AppState& state) {
 
         const bool validate_busy =
             state.gc_validate.active && !state.gc_validate.feed_refresh_all;
-        if (state.gc_autopull.active) {
-            if (action_button("Stop GC pull")) state.cancel_gc_autopull();
+        const bool gc_busy = state.gc_autopull.active || validate_busy;
+        if (gc_busy) {
+            if (action_button("Stop GC refresh")) {
+                if (state.gc_autopull.active) state.cancel_gc_autopull();
+                if (validate_busy) state.cancel_gc_validate();
+            }
         } else {
             ImGui::BeginDisabled(!state.settings.cs2_gc.enabled);
             if (action_button("Refresh GC")) state.refresh_gc_all(true);
@@ -442,8 +446,8 @@ void draw_accounts(app::AppState& state) {
                 if (!state.settings.cs2_gc.enabled)
                     set_tooltip("Enable the CS2 Game Coordinator in Settings to use this.");
                 else
-                    set_tooltip("Pulls level, medals, ranks and cooldown for every account. "
-                                "Skips anything still cached.");
+                    set_tooltip("Connects as each account and pulls its own level, medals, "
+                                "ranks and cooldown. Skips anything still cached.");
             }
         }
 

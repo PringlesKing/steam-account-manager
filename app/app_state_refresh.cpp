@@ -130,7 +130,9 @@ void AppState::refresh_account_data(bool force, bool announce) {
     }
 
     std::vector<std::string> nfa_ids;
-    if (settings.cs2_gc.enabled && !headless) {
+    // If a dedicated Refresh GC sweep is already running, it includes NFA accounts too.
+    // Do not reset/replace that queue with the Refresh-all NFA sub-sweep.
+    if (settings.cs2_gc.enabled && !headless && !gc_validate.active) {
         nfa_ids = collect_nfa_validate_ids(force);
     }
 
@@ -654,24 +656,22 @@ void AppState::refresh_single_account(const std::string& id, bool batch_refresh,
 void AppState::pull_all_for_account(const std::string& id) {
     core::Account* a = find_account(id);
     if (a == nullptr) return;
-    const bool nfa = a->is_nfa;
 
     refresh_single_account(id);
-    if (nfa) {
+    if (!a->is_nfa) refresh_spend(id, true);
 
-        queue_gc_validate(id);
-    } else {
-
-        refresh_spend(id, true);
-        start_gc_autopull();
-    }
+    // GC data must be pulled from the account's own session. Foreign-profile requests are
+    // friend/online gated and are not reliable for arbitrary vault accounts.
+    queue_gc_validate(id);
 }
 
 void AppState::auto_refresh_all() {
     if (!unlocked) return;
 
-    refresh_account_data(false, false);
+    // Start the dedicated GC sweep first. refresh_account_data() detects the active GC queue
+    // and won't replace it with its legacy NFA-only sub-sweep.
     refresh_gc_all(false);
+    refresh_account_data(false, false);
 }
 
 void AppState::refresh_spend(const std::string& id, bool quiet) {
