@@ -517,6 +517,10 @@ void draw_add_account(app::AppState& state) {
             add_account_detail::draw_import_cached(state);
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem("Merge Steam IDs")) {
+            add_account_detail::draw_merge_steam_ids(state);
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem("Import bundle")) {
             draw_import_bundle(state);
             ImGui::EndTabItem();

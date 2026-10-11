@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <iterator>
@@ -307,6 +308,240 @@ JwtImportResult import_jwt_token(app::AppState& state, const std::string& raw,
     }
     r.ok = true;
     return r;
+}
+
+namespace {
+
+std::string trim_merge_field(std::string_view value) {
+    std::size_t first = 0;
+    while (first < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[first]))) {
+        ++first;
+    }
+    std::size_t last = value.size();
+    while (last > first &&
+           std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+        --last;
+    }
+    return std::string(value.substr(first, last - first));
+}
+
+struct SteamIdMergeSummary {
+    int non_empty_lines = 0;
+    int updated = 0;
+    int not_found = 0;
+    int already_has_id = 0;
+    int invalid = 0;
+    int conflicts = 0;
+    int omitted_issues = 0;
+    std::vector<std::string> updated_ids;
+    std::vector<std::string> updated_logins;
+    std::vector<std::string> issues;
+};
+
+void add_merge_issue(SteamIdMergeSummary& summary, std::string message) {
+    constexpr std::size_t kMaxShownIssues = 20;
+    if (summary.issues.size() < kMaxShownIssues) {
+        summary.issues.push_back(std::move(message));
+    } else {
+        ++summary.omitted_issues;
+    }
+}
+
+bool parse_steam_id_64(std::string_view text, std::uint64_t& value) {
+    if (text.empty()) return false;
+    value = 0;
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, value, 10);
+    return parsed.ec == std::errc{} && parsed.ptr == end && value != 0;
+}
+
+bool merge_login_equals(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto ca = static_cast<unsigned char>(a[i]);
+        const auto cb = static_cast<unsigned char>(b[i]);
+        if (std::tolower(ca) != std::tolower(cb)) return false;
+    }
+    return true;
+}
+
+SteamIdMergeSummary merge_steam_ids(app::AppState& state, std::string_view input) {
+    SteamIdMergeSummary summary;
+
+    std::size_t pos = 0;
+    int line_no = 0;
+    while (pos <= input.size()) {
+        ++line_no;
+        const std::size_t end = input.find('\n', pos);
+        const std::size_t count =
+            end == std::string_view::npos ? input.size() - pos : end - pos;
+        const std::string line = trim_merge_field(input.substr(pos, count));
+
+        if (!line.empty()) {
+            ++summary.non_empty_lines;
+
+            // The password/middle fields are deliberately ignored. Taking the login
+            // before the first separator and Steam ID after the last separator also
+            // means passwords may themselves contain separators.
+            constexpr std::string_view kSeparators = ":;|,\t";
+            const std::size_t first_sep = line.find_first_of(kSeparators);
+            const std::size_t last_sep = line.find_last_of(kSeparators);
+
+            if (first_sep == std::string::npos || last_sep == std::string::npos) {
+                ++summary.invalid;
+                add_merge_issue(summary, "Line " + std::to_string(line_no) +
+                    ": expected login:password:steamid (or login:steamid).");
+            } else {
+                const std::string login = trim_merge_field(
+                    std::string_view(line).substr(0, first_sep));
+                const std::string sid_text = trim_merge_field(
+                    std::string_view(line).substr(last_sep + 1));
+
+                std::uint64_t steam_id = 0;
+                if (login.empty() || !parse_steam_id_64(sid_text, steam_id)) {
+                    ++summary.invalid;
+                    add_merge_issue(summary, "Line " + std::to_string(line_no) +
+                        ": empty login or invalid numeric Steam ID.");
+                } else {
+                    // Match by login only. Do not let the pasted Steam ID select a
+                    // different account, and refuse ambiguous duplicate logins rather
+                    // than silently updating whichever happens to appear first.
+                    core::Account* target = nullptr;
+                    int login_matches = 0;
+                    for (auto& account : state.vault.accounts) {
+                        if (!merge_login_equals(account.login, login)) continue;
+                        ++login_matches;
+                        if (target == nullptr) target = &account;
+                    }
+
+                    if (login_matches == 0) {
+                        ++summary.not_found;
+                        add_merge_issue(summary, "Line " + std::to_string(line_no) +
+                            ": " + login + " is not in this vault.");
+                    } else if (login_matches > 1) {
+                        ++summary.conflicts;
+                        add_merge_issue(summary, "Line " + std::to_string(line_no) +
+                            ": " + login + " matches multiple accounts in this vault.");
+                    } else if (target->steam_id_64 != 0) {
+                        ++summary.already_has_id;
+                    } else {
+                        const core::Account* owner = nullptr;
+                        for (const auto& account : state.vault.accounts) {
+                            if (account.steam_id_64 == steam_id &&
+                                account.id != target->id) {
+                                owner = &account;
+                                break;
+                            }
+                        }
+
+                        if (owner != nullptr) {
+                            ++summary.conflicts;
+                            std::string owner_label = owner->login.empty()
+                                ? std::string("another account")
+                                : owner->login;
+                            add_merge_issue(summary, "Line " + std::to_string(line_no) +
+                                ": Steam ID " + std::to_string(steam_id) +
+                                " is already assigned to " + owner_label + ".");
+                        } else {
+                            target->steam_id_64 = steam_id;
+                            summary.updated_ids.push_back(target->id);
+                            summary.updated_logins.push_back(target->login);
+                            ++summary.updated;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (end == std::string_view::npos) break;
+        pos = end + 1;
+    }
+
+    return summary;
+}
+
+}  // namespace
+
+void draw_merge_steam_ids(app::AppState& state) {
+    static std::array<char, 32768> rows_buf{};
+    static SteamIdMergeSummary summary;
+    static bool has_summary = false;
+
+    separator_text("Merge Steam IDs into existing accounts");
+    ImGui::TextWrapped(
+        "Paste one account per line. Example: login:password:7656119... "
+        "(login:7656119... also works). Separators may be :, ;, |, comma, or TAB.");
+    ImGui::PushStyleColor(ImGuiCol_Text, theme::dim_text());
+    ImGui::TextWrapped(
+        "Only the login and final numeric Steam ID are read. Passwords are ignored and "
+        "never saved by this tool. It only fills accounts already in this vault whose "
+        "Steam ID is empty; it never creates new accounts and never overwrites an "
+        "existing Steam ID.");
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+    ImGui::InputTextMultiline("##merge-steam-ids", rows_buf.data(), rows_buf.size(),
+                              ImVec2(-1.0F, 220.0F));
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(rows_buf[0] == 0);
+    if (action_button("Merge Steam IDs")) {
+        summary = merge_steam_ids(state, rows_buf.data());
+        has_summary = true;
+
+        if (summary.updated > 0) {
+            state.vault_dirty = true;
+            state.save_vault_if_dirty();
+            for (const auto& account_id : summary.updated_ids) {
+                state.pull_all_for_account(account_id);
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (action_button("Clear input")) {
+        rows_buf.fill('\0');
+        summary = {};
+        has_summary = false;
+    }
+
+    if (!has_summary) return;
+
+    ImGui::Spacing();
+    if (summary.updated > 0) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::success());
+        ImGui::Text("Updated %d account(s).", summary.updated);
+        ImGui::PopStyleColor();
+        if (!summary.updated_logins.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, theme::dim_text());
+            for (const auto& login : summary.updated_logins) {
+                ImGui::BulletText("%s", login.empty() ? "(login unknown)" : login.c_str());
+            }
+            ImGui::PopStyleColor();
+        }
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::warning());
+        ImGui::TextUnformatted("No accounts were updated.");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::TextDisabled(
+        "Rows: %d | not in vault: %d | already had Steam ID: %d | invalid: %d | conflicts: %d",
+        summary.non_empty_lines, summary.not_found, summary.already_has_id,
+        summary.invalid, summary.conflicts);
+
+    if (!summary.issues.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, theme::warning());
+        for (const auto& issue : summary.issues) {
+            ImGui::BulletText("%s", issue.c_str());
+        }
+        if (summary.omitted_issues > 0) {
+            ImGui::BulletText("...and %d more issue(s).", summary.omitted_issues);
+        }
+        ImGui::PopStyleColor();
+    }
 }
 
 void draw_import_mafile(app::AppState& state) {

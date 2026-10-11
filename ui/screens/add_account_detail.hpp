@@ -21,6 +21,7 @@ void draw_import_mafile(app::AppState& state);
 void draw_import_info_dat(app::AppState& state);
 void draw_import_jwt_token(app::AppState& state);
 void draw_import_cached(app::AppState& state);
+void draw_merge_steam_ids(app::AppState& state);
 void draw_full_login(app::AppState& state);
 
 // Result of importing a single NFA refresh token ("SteamID----JWT" or a bare JWT).
