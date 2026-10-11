@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
-#include <limits>
 #include <string>
 
 #include "core/cs2_gc/gc_emsg.hpp"
@@ -424,14 +423,25 @@ void GcSession::on_gc_message(std::uint32_t gc_emsg, const std::string& body) {
             if (h.account_id() != own) return;
             const auto now = static_cast<std::int64_t>(std::time(nullptr));
             const auto penalty_seconds = h.penalty_seconds();
-            // The GC uses UINT32_MAX as a sentinel for "no active penalty". Treating it
-            // as a duration produces a bogus ~49,710-day cooldown (2^32 - 1 seconds).
-            constexpr auto kNoPenaltySentinel = std::numeric_limits<std::uint32_t>::max();
+
+            // penalty_seconds is a uint32. After a cooldown expires the GC can return a
+            // wrapped value close to UINT32_MAX (effectively expiry-now underflow), not
+            // necessarily UINT32_MAX exactly. Adding that to `now` creates the familiar
+            // ~49,710-day cooldown. A temporary CS2 cooldown lasting over a year is not a
+            // meaningful value here; permanent cooldowns are represented separately.
+            constexpr std::uint32_t kMaxTemporaryPenaltySeconds = 366u * 24u * 60u * 60u;
             own_penalty_.seen = true;
-            own_penalty_.expires =
-                (penalty_seconds == 0 || penalty_seconds == kNoPenaltySentinel)
-                    ? 0
-                    : now + static_cast<std::int64_t>(penalty_seconds);
+            if (penalty_seconds == 0 || penalty_seconds > kMaxTemporaryPenaltySeconds) {
+                if (penalty_seconds > kMaxTemporaryPenaltySeconds) {
+                    SAM_LOG_WARN(
+                        "gc: ignoring implausible penalty_seconds={} reason={} "
+                        "(likely expired uint32 wrap/sentinel)",
+                        penalty_seconds, h.penalty_reason());
+                }
+                own_penalty_.expires = 0;
+            } else {
+                own_penalty_.expires = now + static_cast<std::int64_t>(penalty_seconds);
+            }
             return;
         }
         case GcMsg::PlayersProfile: {

@@ -4,8 +4,8 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <fstream>
-#include <limits>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -37,18 +37,21 @@ crypto::SecureString string_to_secure(const std::string& s) {
     return r;
 }
 
-bool is_legacy_gc_no_penalty_expiry(std::int64_t expiry, std::int64_t pulled_unix) {
-    if (expiry <= 0 || expiry == kCooldownNever || pulled_unix <= 0) return false;
+bool is_legacy_gc_wrapped_cooldown(std::int64_t expiry) {
+    if (expiry <= 0 || expiry == kCooldownNever) return false;
 
-    // Older builds added the GC's UINT32_MAX "no penalty" sentinel to the current
-    // unix time and persisted the result. The two timestamps are recorded a few
-    // seconds apart, so allow a small window when recognizing that legacy value.
-    constexpr std::int64_t kSentinel =
-        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max());
-    constexpr std::int64_t kTimestampSlackSeconds = 300;
-    const std::int64_t delta = expiry - pulled_unix;
-    return delta >= kSentinel - kTimestampSlackSeconds &&
-           delta <= kSentinel + kTimestampSlackSeconds;
+    // The broken GC path did not only persist `now + UINT32_MAX`. Once the real
+    // cooldown had already expired, unsigned subtraction could yield any value close
+    // to UINT32_MAX, producing a bogus expiry roughly 136 years in the future. The
+    // previous migration compared against gc_last_pulled_unix with a 5-minute window,
+    // which misses these wrapped values (e.g. UINT32_MAX - several hours/days).
+    //
+    // Temporary CS2 cooldowns are never meaningfully hundreds of years long. Keep a
+    // deliberately generous one-year ceiling so legitimate cooldowns are untouched,
+    // while all 49,7xx-day legacy values are cleared on vault load.
+    constexpr std::int64_t kMaxTemporaryCooldownSeconds = 366LL * 24LL * 60LL * 60LL;
+    const auto now = static_cast<std::int64_t>(std::time(nullptr));
+    return now > 0 && expiry > now + kMaxTemporaryCooldownSeconds;
 }
 
 std::string ws_to_u8(const std::wstring& s) {
@@ -248,10 +251,10 @@ void from_json(const json& j, CS2Status& c) {
     c.featured_medal_defidx = j.value("featured_medal_defidx", static_cast<std::uint32_t>(0));
     c.medals                = j.value("medals", std::vector<CS2Medal>{});
 
-    // Migrate cooldowns persisted by builds that interpreted UINT32_MAX from the GC
-    // as a real duration. This removes the already-cached ~49,710-day value on load,
-    // without requiring the user to wait for another GC refresh.
-    if (is_legacy_gc_no_penalty_expiry(c.cooldown_expires_unix, c.gc_last_pulled_unix)) {
+    // Migrate cooldowns persisted by builds that treated a wrapped uint32 GC value as
+    // a real duration. This removes already-cached ~49,7xx-day values on vault load,
+    // without requiring another GC refresh.
+    if (is_legacy_gc_wrapped_cooldown(c.cooldown_expires_unix)) {
         c.cooldown_expires_unix = 0;
         c.cooldown_reason.clear();
     }

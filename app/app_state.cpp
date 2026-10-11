@@ -179,8 +179,16 @@ void AppState::apply_gc_snapshot_cache(const std::string& account_id,
     }
 
     if (rk.cooldown_expires_unix >= 0) {
-        acc->cs2.cooldown_expires_unix = rk.cooldown_expires_unix;
-        acc->cs2.cooldown_reason = rk.cooldown_expires_unix > 0 ? rk.cooldown_reason : "";
+        // Defense in depth: never persist an ordinary temporary cooldown hundreds of
+        // years into the future. The GC's uint32 remaining-seconds field can wrap after
+        // expiry and otherwise turns into the visible ~49,710-day bug.
+        constexpr std::int64_t kMaxTemporaryCooldownSeconds = 366LL * 24LL * 60LL * 60LL;
+        auto expiry = rk.cooldown_expires_unix;
+        if (expiry != core::kCooldownNever && expiry > now + kMaxTemporaryCooldownSeconds) {
+            expiry = 0;
+        }
+        acc->cs2.cooldown_expires_unix = expiry;
+        acc->cs2.cooldown_reason = expiry > 0 ? rk.cooldown_reason : "";
     }
     acc->cs2.last_refreshed_unix = now;
 
