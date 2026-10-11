@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -34,6 +35,20 @@ crypto::SecureString string_to_secure(const std::string& s) {
     crypto::SecureString r;
     r.assign(s.begin(), s.end());
     return r;
+}
+
+bool is_legacy_gc_no_penalty_expiry(std::int64_t expiry, std::int64_t pulled_unix) {
+    if (expiry <= 0 || expiry == kCooldownNever || pulled_unix <= 0) return false;
+
+    // Older builds added the GC's UINT32_MAX "no penalty" sentinel to the current
+    // unix time and persisted the result. The two timestamps are recorded a few
+    // seconds apart, so allow a small window when recognizing that legacy value.
+    constexpr std::int64_t kSentinel =
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max());
+    constexpr std::int64_t kTimestampSlackSeconds = 300;
+    const std::int64_t delta = expiry - pulled_unix;
+    return delta >= kSentinel - kTimestampSlackSeconds &&
+           delta <= kSentinel + kTimestampSlackSeconds;
 }
 
 std::string ws_to_u8(const std::wstring& s) {
@@ -232,6 +247,14 @@ void from_json(const json& j, CS2Status& c) {
     c.gc_last_pulled_unix   = j.value("gc_last_pulled_unix", static_cast<std::int64_t>(0));
     c.featured_medal_defidx = j.value("featured_medal_defidx", static_cast<std::uint32_t>(0));
     c.medals                = j.value("medals", std::vector<CS2Medal>{});
+
+    // Migrate cooldowns persisted by builds that interpreted UINT32_MAX from the GC
+    // as a real duration. This removes the already-cached ~49,710-day value on load,
+    // without requiring the user to wait for another GC refresh.
+    if (is_legacy_gc_no_penalty_expiry(c.cooldown_expires_unix, c.gc_last_pulled_unix)) {
+        c.cooldown_expires_unix = 0;
+        c.cooldown_reason.clear();
+    }
 }
 
 void to_json(json& j, const ExternalFundsStatus& f) {

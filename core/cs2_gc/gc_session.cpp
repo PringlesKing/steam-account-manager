@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
+#include <limits>
 #include <string>
 
 #include "core/cs2_gc/gc_emsg.hpp"
@@ -422,9 +423,15 @@ void GcSession::on_gc_message(std::uint32_t gc_emsg, const std::string& body) {
             const auto own = static_cast<std::uint32_t>(cm_.steam_id() & 0xffffffffULL);
             if (h.account_id() != own) return;
             const auto now = static_cast<std::int64_t>(std::time(nullptr));
+            const auto penalty_seconds = h.penalty_seconds();
+            // The GC uses UINT32_MAX as a sentinel for "no active penalty". Treating it
+            // as a duration produces a bogus ~49,710-day cooldown (2^32 - 1 seconds).
+            constexpr auto kNoPenaltySentinel = std::numeric_limits<std::uint32_t>::max();
             own_penalty_.seen = true;
             own_penalty_.expires =
-                h.penalty_seconds() > 0 ? now + static_cast<std::int64_t>(h.penalty_seconds()) : 0;
+                (penalty_seconds == 0 || penalty_seconds == kNoPenaltySentinel)
+                    ? 0
+                    : now + static_cast<std::int64_t>(penalty_seconds);
             return;
         }
         case GcMsg::PlayersProfile: {
