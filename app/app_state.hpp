@@ -389,6 +389,13 @@ struct AppState {
     // stale (manual button); startup/auto pass false.
     void refresh_gc_all(bool announce = false);
 
+    // Same GC refresh as refresh_gc_all(), but limits the accounts whose GC data is
+    // updated to `account_ids`. A puller account outside the set may still be used as the
+    // transport connection; its profile is not refreshed unless it is also in the set.
+    // Cache TTLs are respected, matching the toolbar "Refresh GC" action.
+    void refresh_gc_accounts(const std::vector<std::string>& account_ids,
+                             bool announce = false);
+
     // Posts the staggered per-account GCPD scrape (full-access) for `ids`, ~2s apart. Each
     // account's refresh_single_account(batch_refresh=true) feeds the shared refresh_all counter.
     void post_gcpd_sweep(std::vector<std::string> ids);
@@ -513,6 +520,8 @@ struct AppState {
     // `force` ignores the GC cache TTL. `queue_gc_validate` adds one account (used on add).
     // tick_gc_validate() advances the sweep each frame; cancel stops it.
     void start_gc_validate(bool force);
+    // Starts a normal (non Refresh-all-counter) validate sweep over an explicit id list.
+    void start_gc_validate_ids(std::vector<std::string> ids);
     void queue_gc_validate(const std::string& account_id);
     void tick_gc_validate();
     void cancel_gc_validate();

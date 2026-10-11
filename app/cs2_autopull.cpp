@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -323,25 +324,27 @@ std::string cs2_client_token(const core::Account& a) {
     return {};
 }
 
-void AppState::start_gc_autopull() {
-    if (gc_autopull.active) return;
-    if (gc_autopull.client) cs2_gc::retire(std::move(gc_autopull.client));
-    gc_autopull = GcAutoPull{};
+namespace {
 
-    if (!settings.cs2_gc.enabled) {
+void start_gc_autopull_impl(AppState& st, const std::unordered_set<std::string>* allowed_ids) {
+    if (st.gc_autopull.active) return;
+    if (st.gc_autopull.client) cs2_gc::retire(std::move(st.gc_autopull.client));
+    st.gc_autopull = GcAutoPull{};
+
+    if (!st.settings.cs2_gc.enabled) {
         SAM_LOG_INFO("gc-autopull: CS2 GC disabled in settings");
         return;
     }
 
     const std::int64_t now = now_unix();
-    const int hours = std::clamp(settings.cs2_gc.cache_hours, 1, 24);
+    const int hours = std::clamp(st.settings.cs2_gc.cache_hours, 1, 24);
     const std::int64_t ttl = static_cast<std::int64_t>(hours) * 3600;
 
     int skipped = 0;
     std::unordered_map<std::uint32_t, std::string> targets;
-    for (const auto& a : vault.accounts) {
+    for (const auto& a : st.vault.accounts) {
+        if (allowed_ids != nullptr && allowed_ids->count(a.id) == 0) continue;
         if (a.steam_id_64 == 0) continue;
-
         if (a.is_nfa) continue;
         if (a.cs2.gc_last_pulled_unix != 0 && now - a.cs2.gc_last_pulled_unix < ttl) {
             ++skipped;
@@ -351,28 +354,36 @@ void AppState::start_gc_autopull() {
     }
 
     if (targets.empty()) {
-        gc_autopull.status =
+        st.gc_autopull.status =
             "GC auto-pull: nothing to do (" + std::to_string(skipped) + " fresh)";
         SAM_LOG_INFO("gc-autopull: nothing to pull ({} fresh)", skipped);
         return;
     }
 
-    std::vector<std::string> pullers = build_puller_candidates(*this, now);
+    // The puller is only the transport used to query foreign profiles. It does not become a
+    // target unless it is in `allowed_ids`, so a group refresh cannot update another group.
+    std::vector<std::string> pullers = build_puller_candidates(st, now);
     if (pullers.empty()) {
-        gc_autopull.status = "GC auto-pull: no account can reach the CS2 GC";
+        st.gc_autopull.status = "GC auto-pull: no account can reach the CS2 GC";
         SAM_LOG_INFO("gc-autopull: no eligible puller account");
         return;
     }
 
-    gc_autopull.active = true;
-    gc_autopull.targets = std::move(targets);
-    gc_autopull.total = static_cast<int>(gc_autopull.targets.size());
-    gc_autopull.skipped = skipped;
-    gc_autopull.puller_candidates = std::move(pullers);
-    gc_autopull.status = "Starting GC auto-pull";
+    st.gc_autopull.active = true;
+    st.gc_autopull.targets = std::move(targets);
+    st.gc_autopull.total = static_cast<int>(st.gc_autopull.targets.size());
+    st.gc_autopull.skipped = skipped;
+    st.gc_autopull.puller_candidates = std::move(pullers);
+    st.gc_autopull.status = "Starting GC auto-pull";
     SAM_LOG_INFO("gc-autopull: {} target(s), {} fresh, {} puller candidate(s)",
-                 gc_autopull.total, skipped, gc_autopull.puller_candidates.size());
-    start_puller(*this, gc_autopull, steady_clock::now());
+                 st.gc_autopull.total, skipped, st.gc_autopull.puller_candidates.size());
+    start_puller(st, st.gc_autopull, steady_clock::now());
+}
+
+}  // namespace
+
+void AppState::start_gc_autopull() {
+    start_gc_autopull_impl(*this, nullptr);
 }
 
 void AppState::tick_gc_autopull() {
@@ -489,6 +500,18 @@ void AppState::start_gc_validate_feed(std::vector<std::string> ids) {
     begin_validate(*this);
 }
 
+void AppState::start_gc_validate_ids(std::vector<std::string> ids) {
+    if (ids.empty() || gc_validate.active) return;
+    if (gc_validate.client) cs2_gc::retire(std::move(gc_validate.client));
+    gc_validate = GcValidate{};
+    if (!settings.cs2_gc.enabled) return;
+    gc_validate.active = true;
+    gc_validate.queue = std::move(ids);
+    gc_validate.status = "Refreshing selected GC accounts";
+    SAM_LOG_INFO("gc-validate: {} selected account(s) queued", gc_validate.queue.size());
+    begin_validate(*this);
+}
+
 void AppState::queue_gc_validate(const std::string& account_id) {
     core::Account* a = find_account(account_id);
     if (a == nullptr || a->steam_id_64 == 0) return;
@@ -584,6 +607,42 @@ void AppState::refresh_gc_all(bool announce) {
         ui::widgets::ToastItem t;
         t.id = "refresh-gc-uptodate";
         t.message = "GC data is up to date for all accounts";
+        t.is_warning = true;
+        t.expires_at_unix = now_unix() + settings.notifications.toast_duration_seconds;
+        toasts.push(std::move(t));
+    }
+}
+
+void AppState::refresh_gc_accounts(const std::vector<std::string>& account_ids, bool announce) {
+    if (!settings.cs2_gc.enabled || account_ids.empty()) return;
+
+    // Do not splice a group request into an in-flight global/group request: that would make
+    // the target set ambiguous. The group menu is disabled while either worker is active,
+    // but keep this guard for non-UI callers too.
+    if (gc_autopull.active || gc_validate.active) return;
+
+    const std::unordered_set<std::string> allowed(account_ids.begin(), account_ids.end());
+    start_gc_autopull_impl(*this, &allowed);
+
+    const std::int64_t now = now_unix();
+    const int hours = std::clamp(settings.cs2_gc.cache_hours, 1, 24);
+    const std::int64_t ttl = static_cast<std::int64_t>(hours) * 3600;
+    std::vector<std::string> nfa_ids;
+    nfa_ids.reserve(account_ids.size());
+    for (const auto& a : vault.accounts) {
+        if (allowed.count(a.id) == 0) continue;
+        if (!a.is_nfa || a.steam_id_64 == 0) continue;
+        if (cs2_client_token(a).empty()) continue;
+        if (is_active_steam_user(a) || is_manually_connected(*this, a.id)) continue;
+        if (a.nfa_last_validated_unix != 0 && now - a.nfa_last_validated_unix < ttl) continue;
+        nfa_ids.push_back(a.id);
+    }
+    start_gc_validate_ids(std::move(nfa_ids));
+
+    if (announce && !gc_autopull.active && !gc_validate.active) {
+        ui::widgets::ToastItem t;
+        t.id = "refresh-gc-group-uptodate";
+        t.message = "GC data is up to date for this group";
         t.is_warning = true;
         t.expires_at_unix = now_unix() + settings.notifications.toast_duration_seconds;
         toasts.push(std::move(t));

@@ -475,14 +475,41 @@ ListViewResult draw_list_body(app::AppState& state,
             }
         }
 
-        if (right_clicked && can_manage) {
+        // Every bucket, including Ungrouped, has a context menu. Management actions stay
+        // limited to real groups; Refresh GC is available for every bucket.
+        if (right_clicked) {
             ImGui::OpenPopup(("##group-ctx-" + key).c_str());
         }
         if (begin_styled_popup(("##group-ctx-" + key).c_str())) {
-            if (ImGui::MenuItem("Rename...")) group_to_rename = key;
-            if (ImGui::MenuItem("Delete"))    group_to_delete = key;
+            if (can_manage) {
+                if (ImGui::MenuItem("Rename...")) group_to_rename = key;
+                if (ImGui::MenuItem("Delete"))    group_to_delete = key;
+                ImGui::Separator();
+            }
 
-            if (!state.settings.safe_mode && state.settings.hwid.always_spoof &&
+            // Build from the entire vault rather than `indices`, because `indices` only
+            // contains rows that survive the current search/filter. A group refresh must
+            // include hidden members too. Accounts pointing at a missing group are rendered
+            // as Ungrouped, so use the same rule here.
+            std::vector<std::string> group_account_ids;
+            group_account_ids.reserve(state.vault.accounts.size());
+            for (const auto& acc : state.vault.accounts) {
+                const bool belongs = key.empty()
+                    ? (acc.group_id.empty() || known_group_ids.count(acc.group_id) == 0)
+                    : acc.group_id == key;
+                if (belongs) group_account_ids.push_back(acc.id);
+            }
+
+            const bool gc_busy = state.gc_autopull.active || state.gc_validate.active;
+            const bool gc_available = state.settings.cs2_gc.enabled &&
+                                      !group_account_ids.empty() && !gc_busy;
+            ImGui::BeginDisabled(!gc_available);
+            if (ImGui::MenuItem("Refresh GC")) {
+                state.refresh_gc_accounts(group_account_ids, true);
+            }
+            ImGui::EndDisabled();
+
+            if (can_manage && !state.settings.safe_mode && state.settings.hwid.always_spoof &&
                 ImGui::BeginMenu("HWID spoofer")) {
                 if (ImGui::MenuItem("Exclude all from spoof")) {
                     for (std::size_t idx : indices) {
